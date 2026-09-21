@@ -25,3 +25,21 @@ def test_every_binding_in_the_settings_template_exists_in_the_backend():
 
     for template in ("psucontrol_settings.jinja2", "psucontrol_navbar.jinja2", "psucontrol_wizard.jinja2"):
         assert _bound_keys(template) - defaults == set(), template
+
+
+def test_new_settings_are_offered_by_the_settings_template():
+    bound = _bound_keys("psucontrol_settings.jinja2")
+    assert {"connectTimeout", "postConnectDelay", "turnOnWhenApiUploadPrint"} <= bound
+
+
+def test_the_web_ui_renders_with_autoescaping_and_serves_the_new_settings(make_env):
+    env = make_env()
+
+    page = requests.get(env.base + "/", timeout=30)
+    assert page.status_code == 200
+    assert "settings_plugin_psucontrol" in page.text
+    assert "settings.plugins.psucontrol.connectTimeout" in page.text
+
+    plugin_settings = env.api("GET", "/api/settings").json()["plugins"]["psucontrol"]
+    for key in ("connectTimeout", "postConnectDelay"):
+        assert key in plugin_settings

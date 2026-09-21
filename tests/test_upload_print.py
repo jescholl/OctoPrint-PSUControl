@@ -58,3 +58,67 @@ def test_upload_without_print_flag_never_prints(make_env):
     env.wait_for(lambda: False, timeout=8)
     assert env.started_count("noprint.gcode") == 0
     assert not env.psu_on  # print=false must not power anything on
+
+
+def test_settle_delay_is_honoured(make_env):
+    """The printer reports Operational before it has finished booting; wait before printing."""
+    env = make_env(postConnectDelay=4)
+    assert env.upload("settle.gcode", gcode(60)).status_code == 201
+    assert env.wait_for(lambda: env.started_count("settle.gcode") == 1, timeout=60), env.diagnostics()
+
+    operational = env.first_time('to "Operational"')
+    started = env.first_time("Print job started - origin: local, path: settle.gcode")
+    assert (started - operational).total_seconds() >= 3.8
+
+
+def test_pending_print_is_abandoned_when_the_printer_never_comes_up(make_env):
+    """If the wait times out the request is dropped, and must not fire when the printer connects later."""
+    env = make_env(connect_delay=12, connectTimeout=3)
+    assert env.upload("late.gcode", gcode(60)).status_code == 201
+
+    assert env.wait_for(lambda: "Not starting late.gcode" in env.log_text(), timeout=30), env.diagnostics()
+    assert env.wait_for(lambda: env.printer_state() == "Operational", timeout=40), env.diagnostics()
+    env.wait_for(lambda: False, timeout=6)
+    assert env.started_count("late.gcode") == 0
+
+
+def test_turning_the_psu_off_cancels_a_pending_print(make_env):
+    env = make_env(connect_delay=8, connectTimeout=30)
+    assert env.upload("cancelled.gcode", gcode(60)).status_code == 201
+    assert env.wait_for(lambda: env.psu_on, timeout=20)
+
+    env.psu("turnPSUOff")
+    assert env.wait_for(lambda: "Cancelled pending print of cancelled.gcode" in env.log_text(), timeout=15), env.diagnostics()
+    env.wait_for(lambda: False, timeout=14)
+    assert env.started_count("cancelled.gcode") == 0
+
+
+def test_a_print_queued_behind_a_busy_printer_never_starts_later(make_env):
+    """Upload-and-print while another job runs is refused by OctoPrint; we must not resurrect it."""
+    env = make_env()
+    env.psu("turnPSUOn")
+    assert env.wait_for(lambda: env.printer_state() == "Operational", timeout=45)
+
+    assert env.upload("first.gcode", gcode(20000)).status_code == 201
+    assert env.wait_for(lambda: env.printer_state() == "Printing", timeout=30), env.diagnostics()
+
+    assert env.upload("second.gcode", gcode(60)).status_code == 201
+    env.wait_for(lambda: False, timeout=3)
+
+    r = env.api("POST", "/api/job", json={"command": "cancel"})
+    assert r.status_code == 204, r.text
+    assert env.wait_for(lambda: env.printer_state() == "Operational", timeout=30), env.diagnostics()
+
+    # The moment the printer is free again is when anything queued behind it would fire.
+    env.wait_for(lambda: False, timeout=6)
+    assert env.started_count("second.gcode") == 0
+
+    # ...and so would an unrelated power cycle.
+    env.psu("turnPSUOff")
+    assert env.wait_for(lambda: not env.psu_on, timeout=15)
+    env.psu("turnPSUOn")
+    assert env.wait_for(lambda: env.printer_state() == "Operational", timeout=45)
+    env.wait_for(lambda: False, timeout=8)
+
+    assert env.started_count("second.gcode") == 0
+

@@ -222,10 +222,33 @@
     <div class="control-group">
         <div class="controls">
             <label class="checkbox">
-            <input type="checkbox" data-bind="checked: settings.plugins.psucontrol.turnOnWhenApiUploadPrint"> Turn on prior to printing after API upload
+            <input type="checkbox" data-bind="checked: settings.plugins.psucontrol.turnOnWhenApiUploadPrint"> Turn on, connect and start printing after an API upload with the print option
             </label>
+            <span class="help-block">For example a slicer's "Upload and Print". The upload itself returns straight away; the print is started once the printer is up.</span>
         </div>
     </div>
+    <!-- ko if: settings.plugins.psucontrol.turnOnWhenApiUploadPrint() -->
+    <div class="control-group">
+        <label class="control-label">Connect Timeout</label>
+        <div class="controls">
+            <div class="input-append">
+                <input type="number" min="0" step="1" class="input-mini text-right" data-bind="value: settings.plugins.psucontrol.connectTimeout">
+                <span class="add-on">sec</span>
+            </div>
+            <span class="help-block">How long to wait for the printer to connect. If it is not ready in time the print is not started.</span>
+        </div>
+    </div>
+    <div class="control-group">
+        <label class="control-label">Post Connect Delay</label>
+        <div class="controls">
+            <div class="input-append">
+                <input type="number" min="0" step="0.1" class="input-mini text-right" data-bind="value: settings.plugins.psucontrol.postConnectDelay">
+                <span class="add-on">sec</span>
+            </div>
+            <span class="help-block">Extra time to wait after the printer reports it is connected, before printing. Some printers (Prusa, for one) restart when the serial port opens and are not ready for a few seconds.</span>
+        </div>
+    </div>
+    <!-- /ko -->
     <br />
 
     <h4>Power Off Options</h4>

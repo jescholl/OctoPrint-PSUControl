@@ -16,7 +16,6 @@ from flask_babel import gettext
 import platform
 from octoprint.util import fqfn
 from octoprint.settings import valid_boolean_trues
-import flask
 from . import cli
 
 try:
@@ -59,6 +58,8 @@ class PSUControl(octoprint.plugin.StartupPlugin,
 
         self._autoOnTriggerGCodeCommandsArray = []
         self._idleIgnoreCommandsArray = []
+        self._pending_print = None
+        self._pending_print_lock = threading.Lock()
         self._check_psu_state_thread = None
         self._check_psu_state_event = threading.Event()
         self._idleTimer = None
@@ -84,6 +85,8 @@ class PSUControl(octoprint.plugin.StartupPlugin,
             pseudoOnGCodeCommand = 'M80',
             pseudoOffGCodeCommand = 'M81',
             postOnDelay = 0.0,
+            postConnectDelay = 0.0,
+            connectTimeout = 30.0,
             connectOnPowerOn = False,
             disconnectOnPowerOff = False,
             sensingMethod = 'INTERNAL',
@@ -510,7 +513,7 @@ class PSUControl(octoprint.plugin.StartupPlugin,
             self.check_psu_state()
 
             if self.config['connectOnPowerOn'] and self._printer.is_closed_or_error():
-                self._printer.connect()
+                self._connect_printer()
                 time.sleep(0.1)
 
             if not self._printer.is_closed_or_error():
@@ -518,6 +521,9 @@ class PSUControl(octoprint.plugin.StartupPlugin,
 
 
     def turn_psu_off(self):
+        # Never let a queued upload-and-print outlive the power it was waiting for.
+        self._cancel_pending_print("PSU switched off")
+
         if self.config['switchingMethod'] in ['GCODE', 'GPIO', 'SYSTEM', 'PLUGIN']:
             if not self._printer.is_closed_or_error():
                 self._printer.script("psucontrol_pre_off", must_be_set=False)
@@ -582,17 +588,174 @@ class PSUControl(octoprint.plugin.StartupPlugin,
         return self.isPSUOn
 
 
-    def turn_on_before_printing_after_upload(self):
-        if ( self.config['turnOnWhenApiUploadPrint'] and
-             not self.isPSUOn and
-             flask.request.path.startswith('/api/files/') and
-             flask.request.method == 'POST' and
-             flask.request.values.get('print', 'false') in valid_boolean_trues):
-                self.on_api_command("turnPSUOn", [])
+    def _connect_printer(self):
+        self._printer.connect()
+
+
+    # -- Upload and print ---------------------------------------------------------------------
+    #
+    # OctoPrint decides whether to start a print at the moment an upload arrives. With the
+    # printer off (or still connecting) it is not operational, so OctoPrint silently drops the
+    # print flag and reports effective_print=false in the Upload event. Blocking the request
+    # until the printer is up does not help reliably: "operational" is reached before a real
+    # printer has finished booting, and it holds the slicer's HTTP request open. So we react to
+    # the Upload event instead: power on, connect, wait for the printer, then start the job.
+    #
+    # The pending job is a single slot with an expiry, it is cleared whenever the PSU is
+    # switched off, and it is only ever consumed by the worker that created it, so it can not
+    # start a print at some unrelated later time.
+
+    def _cancel_pending_print(self, reason=None):
+        with self._pending_print_lock:
+            pending = self._pending_print
+            self._pending_print = None
+
+        if pending is not None and reason:
+            self._logger.info("Cancelled pending print of {}: {}".format(pending['path'], reason))
+
+
+    def _pending_print_is_current(self, pending):
+        with self._pending_print_lock:
+            if self._pending_print is not pending:
+                return False
+
+        if time.monotonic() > pending['deadline']:
+            self._logger.warning("Pending print of {} expired before the printer became ready.".format(pending['path']))
+            self._cancel_pending_print()
+            return False
+
+        return True
+
+
+    def _take_pending_print(self, pending):
+        with self._pending_print_lock:
+            if self._pending_print is not pending:
+                return False
+            self._pending_print = None
+            return True
+
+
+    def _on_upload(self, payload):
+        if not self.config['turnOnWhenApiUploadPrint']:
+            return
+
+        if payload.get('target') != 'local' or payload.get('print') not in valid_boolean_trues:
+            return
+
+        # OctoPrint before 1.6 has no effective_print; assume it handled the request.
+        handled = payload.get('effective_print', True) in valid_boolean_trues
+        if handled and self.isPSUOn:
+            return
+
+        if self._printer.is_operational() and not self._printer.is_ready():
+            # Busy (printing, paused, ...): never queue anything behind a running job.
+            return
+
+        pending = None
+        if not handled:
+            now = time.monotonic()
+            pending = dict(
+                path=payload['path'],
+                deadline=now + self.config['postOnDelay'] + self.config['connectTimeout'] + self.config['postConnectDelay'] + 30.0
+            )
+
+        with self._pending_print_lock:
+            self._pending_print = pending
+
+        worker = threading.Thread(target=self._upload_print_worker, args=(pending,), name="psucontrol-upload-print")
+        worker.daemon = True
+        worker.start()
+
+
+    def _upload_print_worker(self, pending):
+        try:
+            if not self.isPSUOn:
+                self._logger.info("Print requested by API upload while PSU is off. Turning PSU On")
+                self.turn_psu_on()
+
+            if pending is None:
+                return
+
+            if not self._wait_for_printer(pending):
+                return
+
+            if not self._sleep_while_pending(pending, self.config['postConnectDelay']):
+                return
+
+            self._start_pending_print(pending)
+        except Exception:
+            self._logger.exception("Error while processing print requested by API upload")
+            self._cancel_pending_print()
+
+
+    def _sleep_while_pending(self, pending, seconds):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if not self._pending_print_is_current(pending):
+                return False
+            time.sleep(min(0.25, max(0.0, end - time.monotonic())))
+
+        return self._pending_print_is_current(pending)
+
+
+    def _wait_for_printer(self, pending):
+        timeout = time.monotonic() + self.config['connectTimeout']
+        last_attempt = 0.0
+
+        while True:
+            if not self._pending_print_is_current(pending):
+                return False
+
+            if self._printer.is_ready():
+                return True
+
+            if self._printer.is_closed_or_error() and time.monotonic() - last_attempt >= 2.0:
+                self._logger.info("Printer not connected. Connecting")
+                last_attempt = time.monotonic()
+                self._connect_printer()
+
+            if time.monotonic() > timeout:
+                self._logger.warning("Printer did not become ready within {}s. Not starting {}".format(
+                    self.config['connectTimeout'], pending['path']))
+                self._cancel_pending_print()
+                return False
+
+            time.sleep(0.25)
+
+
+    def _start_pending_print(self, pending):
+        path = pending['path']
+
+        if not self._pending_print_is_current(pending):
+            return
+
+        if not self._printer.is_ready():
+            self._logger.warning("Printer is busy. Not starting {}".format(path))
+            self._cancel_pending_print()
+            return
+
+        if not self._file_manager.file_exists("local", path):
+            self._logger.warning("Uploaded file {} no longer exists. Not starting it".format(path))
+            self._cancel_pending_print()
+            return
+
+        # Consume the request before acting on it: nothing can start this file a second time.
+        if not self._take_pending_print(pending):
+            return
+
+        self._logger.info("Printer ready. Starting print of {}".format(path))
+        # A storage-relative path: OctoPrint 1.x resolves it itself, and 2.x requires it.
+        self._printer.select_file(path, False, printAfterSelect=True)
 
 
     def on_event(self, event, payload):
-        if event == Events.CLIENT_OPENED:
+        if event == Events.UPLOAD:
+            self._on_upload(payload)
+            return
+        elif event == Events.SHUTDOWN:
+            self._cancel_pending_print()
+            return
+        elif event == Events.CLIENT_OPENED:
             self._plugin_manager.send_plugin_message(self._identifier, dict(isPSUOn=self.isPSUOn))
             return
         elif event == Events.ERROR and self.config['turnOffWhenError']:
@@ -854,10 +1017,6 @@ class PSUControl(octoprint.plugin.StartupPlugin,
         ]
 
 
-    def _hook_octoprint_server_api_before_request(self, *args, **kwargs):
-        return [self.turn_on_before_printing_after_upload]
-
-
 __plugin_name__ = "PSU Control"
 __plugin_pythoncompat__ = ">=2.7,<4"
 
@@ -872,7 +1031,6 @@ def __plugin_load__():
         "octoprint.events.register_custom_events": __plugin_implementation__.register_custom_events,
         "octoprint.access.permissions": __plugin_implementation__.get_additional_permissions,
         "octoprint.cli.commands": cli.commands,
-        "octoprint.server.api.before_request": __plugin_implementation__._hook_octoprint_server_api_before_request,
     }
 
     global __plugin_helpers__
