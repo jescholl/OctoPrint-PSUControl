@@ -14,6 +14,8 @@ import socket
 import subprocess
 import sys
 import time
+import warnings
+from datetime import datetime
 
 import pytest
 import requests
@@ -50,7 +52,8 @@ def _free_port():
 
 
 class OctoPrintEnv:
-    def __init__(self, tmp_path, psu_settings):
+    def __init__(self, tmp_path, psu_settings, connect_delay=None):
+        self.connect_delay = connect_delay
         self.basedir = tmp_path / "octoprint"
         self.basedir.mkdir()
         self.flag = tmp_path / "psu_on"
@@ -104,19 +107,54 @@ class OctoPrintEnv:
         with open(self.basedir / "config.yaml", "w") as f:
             yaml.safe_dump(cfg, f)
 
-    def start(self):
+    def _spawn(self):
         plugins_dir = self.basedir / "plugins"
         plugins_dir.mkdir(exist_ok=True)
         shutil.copy(os.path.join(HERE, "support", "slowvirtual.py"), plugins_dir / "slowvirtual.py")
 
         env = dict(os.environ, PYTHONUNBUFFERED="1")
+        if self.connect_delay is not None:
+            env["SLOWVIRTUAL_CONNECT_DELAY"] = str(self.connect_delay)
         self.stdout = open(self.basedir / "stdout.log", "w")
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "octoprint", "--basedir", str(self.basedir), "serve",
              "--host", "127.0.0.1", "--port", str(self.port)],
             stdout=self.stdout, stderr=subprocess.STDOUT, env=env,
+            # `python -m` puts the cwd on sys.path. Run from a neutral directory so the plugin
+            # under test is always the one installed in this virtualenv, never a stray checkout.
+            cwd=str(self.basedir),
         )
-        assert self.wait_for(self._plugin_answers, timeout=90), "OctoPrint/plugin never came up:\n" + self.diagnostics()
+
+    def _output_seen(self):
+        try:
+            stdout = (self.basedir / "stdout.log").read_text(errors="replace")
+        except FileNotFoundError:
+            stdout = ""
+        return bool(stdout.strip() or self.log_text().strip())
+
+    def start(self):
+        self._spawn()
+        if self.wait_for(self._plugin_answers, timeout=45):
+            return
+
+        # A start that produced no output at all never reached the plugin (seen rarely on
+        # OctoPrint 2.0 release candidates). Retry that once, loudly; anything else is a real failure.
+        if not self._output_seen():
+            warnings.warn("OctoPrint printed nothing in 45s (state: %s); restarting it once" % self._proc_state())
+            self.stop()
+            self.port = _free_port()
+            self.base = "http://127.0.0.1:%d" % self.port
+            self._spawn()
+            if self.wait_for(self._plugin_answers, timeout=90):
+                return
+
+        raise AssertionError("OctoPrint/plugin never came up (%s):\n%s" % (self._proc_state(), self.diagnostics()))
+
+    def _proc_state(self):
+        if self.proc is None:
+            return "not started"
+        code = self.proc.poll()
+        return "still running" if code is None else "exited with code %s" % code
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -185,6 +223,13 @@ class OctoPrintEnv:
         except FileNotFoundError:
             return ""
 
+    def first_time(self, needle):
+        """Timestamp of the first octoprint.log line containing ``needle`` (or None)."""
+        for line in self.log_text().splitlines():
+            if needle in line:
+                return datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S,%f")
+        return None
+
     def started_count(self, name):
         return self.log_text().count("Print job started - origin: local, path: %s" % name)
 
@@ -198,11 +243,11 @@ class OctoPrintEnv:
 
 
 @pytest.fixture
-def make_env(tmp_path):
+def make_env(tmp_path, request):
     envs = []
 
-    def factory(**psu_settings):
-        env = OctoPrintEnv(tmp_path, psu_settings)
+    def factory(connect_delay=None, **psu_settings):
+        env = OctoPrintEnv(tmp_path, psu_settings, connect_delay=connect_delay)
         envs.append(env)
         env.start()
         return env
@@ -210,3 +255,11 @@ def make_env(tmp_path):
     yield factory
     for env in envs:
         env.stop()
+
+    # Set PSUCONTROL_TEST_LOGS=<dir> to keep each test's octoprint.log, even when it passes.
+    keep = os.environ.get("PSUCONTROL_TEST_LOGS")
+    if keep and envs:
+        os.makedirs(keep, exist_ok=True)
+        src = envs[-1].basedir / "logs" / "octoprint.log"
+        if src.exists():
+            shutil.copy(src, os.path.join(keep, request.node.name + ".log"))
