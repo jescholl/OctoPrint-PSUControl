@@ -31,10 +31,7 @@ except ValueError:
 
 SUPPORTS_LINE_BIAS = KERNEL_VERSION >= (5, 5)
 
-try:
-    from octoprint.access.permissions import Permissions
-except Exception:
-    from octoprint.server import user_permission
+from octoprint.access.permissions import Permissions
 
 try:
     from octoprint.util import ResettableTimer
@@ -764,6 +761,10 @@ class PSUControl(octoprint.plugin.StartupPlugin,
             return
 
 
+    def is_api_protected(self):
+        return True
+
+
     def get_api_commands(self):
         return dict(
             turnPSUOn=[],
@@ -779,19 +780,11 @@ class PSUControl(octoprint.plugin.StartupPlugin,
 
     def on_api_command(self, command, data):
         if command in ['turnPSUOn', 'turnPSUOff', 'togglePSU']:
-            try:
-                if not Permissions.PLUGIN_PSUCONTROL_CONTROL.can():
-                    return make_response("Insufficient rights", 403)
-            except:
-                if not user_permission.can():
-                    return make_response("Insufficient rights", 403)
+            if not Permissions.PLUGIN_PSUCONTROL_CONTROL.can():
+                return make_response("Insufficient rights", 403)
         elif command in ['getPSUState']:
-            try:
-                if not Permissions.STATUS.can():
-                    return make_response("Insufficient rights", 403)
-            except:
-                if not user_permission.can():
-                    return make_response("Insufficient rights", 403)
+            if not Permissions.STATUS.can():
+                return make_response("Insufficient rights", 403)
 
         if command == 'turnPSUOn':
             self.turn_psu_on()
@@ -968,6 +961,10 @@ class PSUControl(octoprint.plugin.StartupPlugin,
             "hasGPIO": HAS_GPIO,
             "supportsLineBias": SUPPORTS_LINE_BIAS
         }
+
+
+    def is_template_autoescaped(self):
+        return True
 
 
     def get_template_configs(self):
