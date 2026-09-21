@@ -996,12 +996,12 @@ class PSUControl(octoprint.plugin.StartupPlugin,
 
                 # version check: github repository
                 type="github_release",
-                user="kantlivelong",
+                user="jescholl",
                 repo="OctoPrint-PSUControl",
                 current=self._plugin_version,
 
                 # update method: pip w/ dependency links
-                pip="https://github.com/kantlivelong/OctoPrint-PSUControl/archive/{target_version}.zip"
+                pip="https://github.com/jescholl/OctoPrint-PSUControl/archive/{target_version}.zip"
             )
         )
 
