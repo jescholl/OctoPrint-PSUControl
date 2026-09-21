@@ -24,8 +24,10 @@ Bugs and requests for this fork go to this repository's issues. The Support and 
 
 To run the tests, in a virtualenv that has OctoPrint installed:
 
-    pip install -e . pytest requests
+    pip install -e . --no-build-isolation -r tests/requirements.txt
     pytest tests
+
+CI runs them for every pull request, on OctoPrint 1.11.8 and 2.0.0rc5. **Releases are automatic**: bump `plugin_version` in `setup.py` and merge to the default branch. Once the tests pass, tag `v<version>` and a GitHub release with the built packages are published. Install one with `pip install https://github.com/jescholl/OctoPrint-PSUControl/archive/refs/tags/v<version>.zip`.
  
  
 ## Setup
