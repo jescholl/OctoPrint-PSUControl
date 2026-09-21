@@ -29,7 +29,7 @@ def test_every_binding_in_the_settings_template_exists_in_the_backend():
 
 def test_new_settings_are_offered_by_the_settings_template():
     bound = _bound_keys("psucontrol_settings.jinja2")
-    assert {"connectTimeout", "postConnectDelay", "turnOnWhenApiUploadPrint"} <= bound
+    assert {"connectTimeout", "postConnectDelay", "idleIgnoreHeaters", "turnOnWhenApiUploadPrint"} <= bound
 
 
 def test_the_web_ui_renders_with_autoescaping_and_serves_the_new_settings(make_env):
@@ -41,5 +41,5 @@ def test_the_web_ui_renders_with_autoescaping_and_serves_the_new_settings(make_e
     assert "settings.plugins.psucontrol.connectTimeout" in page.text
 
     plugin_settings = env.api("GET", "/api/settings").json()["plugins"]["psucontrol"]
-    for key in ("connectTimeout", "postConnectDelay"):
+    for key in ("connectTimeout", "postConnectDelay", "idleIgnoreHeaters"):
         assert key in plugin_settings

@@ -55,6 +55,7 @@ class PSUControl(octoprint.plugin.StartupPlugin,
 
         self._autoOnTriggerGCodeCommandsArray = []
         self._idleIgnoreCommandsArray = []
+        self._idleIgnoreHeatersArray = []
         self._pending_print = None
         self._pending_print_lock = threading.Lock()
         self._check_psu_state_thread = None
@@ -99,6 +100,7 @@ class PSUControl(octoprint.plugin.StartupPlugin,
             powerOffWhenIdle = False,
             idleTimeout = 30,
             idleIgnoreCommands = 'M105',
+            idleIgnoreHeaters = '',
             idleTimeoutWaitTemp = 50,
             turnOnWhenApiUploadPrint = False,
             turnOffWhenError = False
@@ -145,6 +147,7 @@ class PSUControl(octoprint.plugin.StartupPlugin,
 
         self._autoOnTriggerGCodeCommandsArray = self.config['autoOnTriggerGCodeCommands'].split(',')
         self._idleIgnoreCommandsArray = self.config['idleIgnoreCommands'].split(',')
+        self._idleIgnoreHeatersArray = [h.strip() for h in self.config['idleIgnoreHeaters'].split(',') if h.strip()]
 
 
     def on_after_startup(self):
@@ -368,6 +371,10 @@ class PSUControl(octoprint.plugin.StartupPlugin,
         heaters = self._printer.get_current_temperatures()
 
         for heater, entry in heaters.items():
+            if heater in self._idleIgnoreHeatersArray:
+                self._logger.debug("Ignoring heater {}.".format(heater))
+                continue
+
             target = entry.get("target")
             if target is None:
                 # heater doesn't exist in fw
@@ -396,7 +403,7 @@ class PSUControl(octoprint.plugin.StartupPlugin,
             highest_temp = 0
             heaters_above_waittemp = []
             for heater, entry in heaters.items():
-                if not heater.startswith("tool"):
+                if not heater.startswith("tool") or heater in self._idleIgnoreHeatersArray:
                     continue
 
                 actual = entry.get("actual")
