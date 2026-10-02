@@ -60,6 +60,9 @@ class PSUControl(octoprint.plugin.StartupPlugin,
         self._pending_print_lock = threading.Lock()
         self._check_psu_state_thread = None
         self._check_psu_state_event = threading.Event()
+        self._psu_state_polls = 0
+        self._psu_state_polled = threading.Condition()
+        self._autoOnFailed = False
         self._idleTimer = None
         self._waitForHeaters = False
         self._skipIdleTimer = False
@@ -313,12 +316,18 @@ class PSUControl(octoprint.plugin.StartupPlugin,
                 event = Events.PLUGIN_PSUCONTROL_PSU_STATE_CHANGED
                 self._event_bus.fire(event, payload=dict(isPSUOn=self.isPSUOn))
 
+                self._autoOnFailed = False
+
             if (old_isPSUOn != self.isPSUOn) and self.isPSUOn:
                 self._start_idle_timer()
             elif (old_isPSUOn != self.isPSUOn) and not self.isPSUOn:
                 self._stop_idle_timer()
 
             self._plugin_manager.send_plugin_message(self._identifier, dict(isPSUOn=self.isPSUOn))
+
+            with self._psu_state_polled:
+                self._psu_state_polls += 1
+                self._psu_state_polled.notify_all()
 
             self._check_psu_state_event.wait(self.config['sensePollingInterval'])
             self._check_psu_state_event.clear()
@@ -448,9 +457,18 @@ class PSUControl(octoprint.plugin.StartupPlugin,
                 comm_instance._log("PSUControl: ok")
                 skipQueuing = True
 
-        if (not self.isPSUOn and self.config['autoOn'] and (gcode in self._autoOnTriggerGCodeCommandsArray)):
+        if (not self.isPSUOn and self.config['autoOn'] and not self._autoOnFailed and (gcode in self._autoOnTriggerGCodeCommandsArray)):
             self._logger.info("Auto-On - Turning PSU On (Triggered by {})".format(gcode))
             self.turn_psu_on()
+
+            # Retrying on every trigger G-code would hold each one for postOnDelay, starving a running print.
+            if not self._wait_for_sensed_psu_on():
+                self._autoOnFailed = True
+                self._logger.warning("Auto-On - PSU still reported off after switching it on. Not retrying until the sensed PSU state changes.")
+                if self._printer.is_printing():
+                    self._logger.warning("Auto-On - Pausing the print")
+                    # Not from inside the queuing hook: OctoPrint holds its send locks here.
+                    threading.Thread(target=self._printer.pause_print, name="psucontrol-auto-on-pause", daemon=True).start()
 
         if self.config['powerOffWhenIdle'] and self.isPSUOn and not self._skipIdleTimer:
             if not (gcode in self._idleIgnoreCommandsArray):
@@ -459,6 +477,17 @@ class PSUControl(octoprint.plugin.StartupPlugin,
 
         if skipQueuing:
             return (None,)
+
+
+    def _wait_for_sensed_psu_on(self):
+        # A poll already running when the PSU was switched may report the old state, so wait for two.
+        with self._psu_state_polled:
+            target = self._psu_state_polls + 2
+            self._psu_state_polled.wait_for(
+                lambda: self.isPSUOn or self._psu_state_polls >= target,
+                timeout=2 * self.config['sensePollingInterval'] + 10
+            )
+        return self.isPSUOn
 
 
     def turn_psu_on(self):
