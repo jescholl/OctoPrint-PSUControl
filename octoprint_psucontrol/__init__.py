@@ -705,6 +705,10 @@ class PSUControl(octoprint.plugin.StartupPlugin,
             if not self.isPSUOn:
                 self._logger.info("Print requested by API upload while PSU is off. Turning PSU On")
                 self.turn_psu_on()
+            elif not self._printer.is_operational():
+                # The sensed state can be stale; switching on is idempotent, so trust the printer not answering.
+                self._logger.info("Print requested by API upload while the printer is not connected. Turning PSU On even though it is sensed on")
+                self.turn_psu_on()
 
             if pending is None:
                 return

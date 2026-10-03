@@ -122,3 +122,17 @@ def test_a_print_queued_behind_a_busy_printer_never_starts_later(make_env):
 
     assert env.started_count("second.gcode") == 0
 
+
+
+def test_upload_powers_on_a_disconnected_printer_even_when_sensed_on(make_env):
+    """A stale sensed "on" (e.g. a missed power-off report) must not stop upload-and-print powering on."""
+    env = make_env(senseSystemCommand="true")
+    assert env.wait_for(env.plugin_thinks_psu_on)
+    assert not env.psu_on
+    assert env.printer_state() in CLOSED_STATES
+
+    r = env.upload("stale.gcode", gcode(60))
+    assert r.status_code == 201, r.text
+
+    assert env.wait_for(lambda: env.started_count("stale.gcode") == 1, timeout=60), env.diagnostics()
+    assert env.psu_on
